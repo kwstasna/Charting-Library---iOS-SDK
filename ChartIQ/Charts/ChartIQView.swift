@@ -10,6 +10,26 @@ import UIKit
 import WebKit
 import CoreTelephony
 
+@objc(ChartIQLoadingDelegate)
+public protocol ChartIQLoadingDelegate {
+    /// Called when the chart has been loaded
+    /// html loaded, studies loaded, candles loaded
+    ///
+    /// - Parameters:
+    ///   - chartIQView: The ChartIQView Object
+    ///   - elapsedTimes: The elapsed times for all loading stages
+    func chartIQView(_ chartView: ChartIQView, didFinishLoadingWithElapsedTimes elapsedTimes: [ChartLoadingElapsedTime])
+    
+    /// Called when the chart failed to load
+    ///
+    /// - Parameters:
+    ///   - chartIQView: The ChartIQView Object
+    ///   - error: The chart loading error
+    ///   - elapsedTimes: The elapsed times for all loading stages up to when the error occurred
+    ///   - url: The URL String that will load the chart
+    func chartIQView(_ chartView: ChartIQView, didFailLoadingWithError error: Error, elapsedTimes: [ChartLoadingElapsedTime], for url: String)
+}
+
 @objc(ChartIQDataSource)
 public protocol ChartIQDataSource
 {
@@ -45,6 +65,12 @@ public protocol ChartIQDelegate
     ///   - chartIQView: The ChartIQView Object
     @objc func chartIQViewDidFinishLoading(_ chartIQView: ChartIQView)
     
+    /// Called when the ChartIQ has drawn candles
+    ///
+    /// - Parameters:
+    ///   - chartIQView: The ChartIQView Object
+    @objc func chartIQViewDidDrawCandles(_ chartIQView: ChartIQView)
+    
     /// Called when the symbol changes
     ///
     /// - Parameters:
@@ -66,10 +92,19 @@ public protocol ChartIQDelegate
     ///   - drawings: The drawing objects in JSON format
     @objc optional func chartIQView(_ chartIQView: ChartIQView, didUpdateDrawing drawings: Any)
     
-    /// Called when Javascript produces an error -XM
-    @objc func didReceiveJavascriptError(with message: String)
+    /// Called when javascript produces a log type (log, error, warn)
+    ///
+    /// - Parameters:
+    ///   - chartIQView: The ChartIQView Object
+    ///   - type: The type of log that comes from JS (log, error, warn)
+    ///   - message: The actual string message that comes from JS
+    @objc func chartIQView(_ chartIQView: ChartIQView, didReceiveProxyLogging type: ChartIQProxyLoggerType, message: String)
     
     /// Called when a user deletes a Study from the ChartIQ
+    ///
+    /// - Parameters:
+    ///   - chartIQView: The ChartIQView Object
+    ///   - name: The name of the study that is deleted
     @objc func chartIQView(_ chartIQView: ChartIQView, didDeleteStudy name: String)
     
     /// Called when a user taps on the screen and we receive a callback from JS that the user tapped the chart from an inactive area. Definition of Active Area: Crosshair enabled, Drawing on highlight/edit mode.
@@ -110,9 +145,8 @@ public protocol ChartIQDelegate
     ///
     /// - Parameters:
     ///   - chartIQView: The ChartIQView Object
-    ///   - drawing: The Drawing that was removed from the Chart
+    ///   - error: Error Code
     @objc func chartIQViewDidReceiveError(_ chartIQView: ChartIQView, errorCode error: ChartIQErrorHandler)
-    
 }
 
 /// ChartIQ Custom XM Error Handler
@@ -123,6 +157,14 @@ public enum ChartIQErrorHandler: Int {
     case removeDrawingFailed
     case drawingNotInDataSet
     case invalidDrawingName
+}
+
+/// Data Method
+@objc
+public enum ChartIQProxyLoggerType: Int {
+    case log
+    case logWarn
+    case logError
 }
 
 /// Data Method
@@ -211,11 +253,13 @@ public class ChartIQView: UIView {
     
     internal var webView: WKWebView!
     
+    var loadingTracker: ChartLoadingTracker?
+    
     static internal var url = ""
     static internal var refreshInterval = 0
     static internal var voiceoverFields: [String: Bool] = [:]
     
-    public static var chartIQUrl: String {
+    public var chartIQUrl: String {
         return ChartIQView.url
     }
     
@@ -267,6 +311,11 @@ public class ChartIQView: UIView {
     weak public var dataSource: ChartIQDataSource?
     
     weak public var delegate: ChartIQDelegate?
+    weak public var loadingDelegate: ChartIQLoadingDelegate?
+    
+    public var isWebViewLoading: Bool {
+        return webView.isLoading
+    }
     
     public var symbol: String {
         return webView.evaluateJavaScriptWithReturn("stxx.chart.symbol") ?? ""
@@ -374,6 +423,8 @@ public class ChartIQView: UIView {
         case drawingEdited = "drawingEdited"
         case drawingRemoved = "drawingRemoved"
         case errorHandler = "error"
+        case loadingChartFailed = "loadingChartFailed"
+        case loadingChartSuccess = "loadingChartSuccess"
     }
     
     internal static var isValidApiKey = false
@@ -406,8 +457,8 @@ public class ChartIQView: UIView {
     
     internal func initialize() {
         setupWebView()
-        NotificationCenter.default.addObserver(self, selector: #selector(ChartIQView.applicationWillResignActive), name: NSNotification.Name.UIApplicationWillResignActive, object: nil)
-        NotificationCenter.default.addObserver(self, selector: #selector(ChartIQView.applicationDidBecomeActive), name: NSNotification.Name.UIApplicationDidBecomeActive, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(ChartIQView.applicationWillResignActive), name: UIApplication.willResignActiveNotification, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(ChartIQView.applicationDidBecomeActive), name: UIApplication.didBecomeActiveNotification, object: nil)
     }
     
     /// Cleans up the message handlers in order to avoid a memory leak.
@@ -428,7 +479,8 @@ public class ChartIQView: UIView {
         webView.configuration.userContentController.removeScriptMessageHandler(forName: ChartIQCallbackMessage.drawingEdited.rawValue)
         webView.configuration.userContentController.removeScriptMessageHandler(forName: ChartIQCallbackMessage.drawingRemoved.rawValue)
         webView.configuration.userContentController.removeScriptMessageHandler(forName: ChartIQCallbackMessage.errorHandler.rawValue)
-        
+        webView.configuration.userContentController.removeScriptMessageHandler(forName: ChartIQCallbackMessage.loadingChartFailed.rawValue)
+        webView.configuration.userContentController.removeScriptMessageHandler(forName: ChartIQCallbackMessage.loadingChartSuccess.rawValue)
     }
     
     /// Sets your ROKO Mobi api id and url here.
@@ -609,12 +661,12 @@ public class ChartIQView: UIView {
     // MARK: - Notification Handler
     
     /// Handles UIApplicationWillResignActive notification
-    func applicationWillResignActive() {
+    @objc func applicationWillResignActive() {
         addEvent("_ROKO.Inactive User")
     }
     
     /// Handles UIApplicationDidBecomeActive notification
-    func applicationDidBecomeActive() {
+    @objc func applicationDidBecomeActive() {
         addEvent("_ROKO.Active User")
     }
     
@@ -666,6 +718,9 @@ public class ChartIQView: UIView {
         userContentController.add(self, name: ChartIQCallbackMessage.drawingEdited.rawValue)
         userContentController.add(self, name: ChartIQCallbackMessage.drawingRemoved.rawValue)
         userContentController.add(self, name: ChartIQCallbackMessage.errorHandler.rawValue)
+        userContentController.add(self, name: ChartIQCallbackMessage.loadingChartFailed.rawValue)
+        userContentController.add(self, name: ChartIQCallbackMessage.loadingChartSuccess.rawValue)
+
         
         // Create the configuration with the user content controller
         let configuration = WKWebViewConfiguration()
@@ -787,7 +842,7 @@ public class ChartIQView: UIView {
     /// - Parameters:
     ///   - symbol: The symbol for the new chart - a symbol string
     public func setSymbol(_ symbol: String) {
-        if(UIAccessibilityIsVoiceOverRunning()) {
+        if(UIAccessibility.isVoiceOverRunning) {
             let source = "accessibilityMode();"
             webView.evaluateJavaScript(source, completionHandler: nil)
         }
@@ -1276,7 +1331,7 @@ public class ChartIQView: UIView {
         if let inputs = inputs {
             do {
                 let jsonData = try JSONSerialization.data(withJSONObject: inputs, options: .prettyPrinted)
-                _inputs = String(data: jsonData, encoding: .utf8)
+                _inputs = String(data: jsonData, encoding: .utf8) ?? ""
             } catch {
                 throw ChartIQStudyError.invalidInput
             }
@@ -1284,7 +1339,7 @@ public class ChartIQView: UIView {
         if let outputs = outputs {
             do {
                 let jsonData = try JSONSerialization.data(withJSONObject: outputs, options: .prettyPrinted)
-                _outputs = String(data: jsonData, encoding: .utf8)
+                _outputs = String(data: jsonData, encoding: .utf8) ?? ""
             } catch {
                 throw ChartIQStudyError.invalidOutput
             }
@@ -1294,7 +1349,7 @@ public class ChartIQView: UIView {
             throw ChartIQStudyError.studyNotFound
         }
         
-        let script = "addStudy('\(name)', \(_inputs!), \(_outputs!));"
+        let script = "addStudy('\(name)', \(_inputs), \(_outputs));"
         webView.evaluateJavaScript(script, completionHandler: nil)
         addEvent("CHIQ_addStudy", parameters: ["studyName": name])
     }
@@ -1586,6 +1641,7 @@ extension ChartIQView: WKScriptMessageHandler {
         switch callbackMessage {
         case .newSymbol:
             if let symbol = message.body as? String {
+                loadingTracker?.loaded()
                 delegate?.chartIQView?(self, didUpdateSymbol: symbol)
             }
         case .pullInitialData:
@@ -1697,10 +1753,10 @@ extension ChartIQView: WKScriptMessageHandler {
                         selectedFields += ", " + volume
                     }
                     
-                    UIAccessibilityPostNotification(UIAccessibilityAnnouncementNotification, selectedFields);
+                    UIAccessibility.post(notification: UIAccessibility.Notification.announcement, argument: selectedFields);
                 } else {
                     // field is missing, just quote the entire value
-                    UIAccessibilityPostNotification(UIAccessibilityAnnouncementNotification, quote);
+                    UIAccessibility.post(notification: UIAccessibility.Notification.announcement, argument: quote);
                 }
             }
         case .log:
@@ -1720,7 +1776,11 @@ extension ChartIQView: WKScriptMessageHandler {
             NSLog("%@: %@", method, msg)
             print("\(method) \(msg)")
             if method == "ERROR" {
-                delegate?.didReceiveJavascriptError(with: msg)
+                delegate?.chartIQView(self, didReceiveProxyLogging: .logError, message: msg)
+            } else if method == "WARN" {
+                delegate?.chartIQView(self, didReceiveProxyLogging: .logWarn, message: msg)
+            } else {
+                delegate?.chartIQView(self, didReceiveProxyLogging: .log, message: msg)
             }
         case .deletedStudy:
             guard let message = message.body as? [String: Any],
@@ -1769,20 +1829,73 @@ extension ChartIQView: WKScriptMessageHandler {
             default:
                 break
             }
+        case .loadingChartFailed:
+            if let errorMessage = message.body as? String {
+                loadingTracker?.failed(with: ChartLoadingError.internalError(errorMessage), for: chartIQUrl)
+            }
+        case .loadingChartSuccess:
+            delegate?.chartIQViewDidDrawCandles(self)
         }
     }
 }
 
 extension ChartIQView : WKNavigationDelegate {
     
+    public func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+        loadingTracker = ChartLoadingTracker()
+        loadingTracker?.delegate = self
+    }
+    
+    public func webView(_ webView: WKWebView, decidePolicyFor navigationResponse: WKNavigationResponse, decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void) {
+        guard let statusCode = (navigationResponse.response as? HTTPURLResponse)?.statusCode else {
+            // if there's no http status code to act on, exit and allow navigation
+            decisionHandler(.allow)
+            return
+        }
+        switch statusCode {
+        case 400...:
+            decisionHandler(.cancel)
+        default:
+            decisionHandler(.allow)
+        }
+    }
+    
+    public func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
+        loadingTracker?.commit()
+    }
+    
     public func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        loadingTracker?.htmlLoaded()
         getStudyObjects(completionHandler: { [weak self] in
             guard let strongSelf = self else {
                 return
             }
             strongSelf.loadDefaultSetting()
+            strongSelf.loadingTracker?.studiesLoaded()
             strongSelf.delegate?.chartIQViewDidFinishLoading(strongSelf)
         })
     }
     
+    public func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        loadingTracker?.failed(with: error, for: chartIQUrl)
+    }
+    
+    public func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        loadingTracker?.failed(with: error, for: chartIQUrl)
+    }
+    
+    public func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        webView.reload() //https://trac.webkit.org/changeset/232668/webkit
+        delegate?.chartIQView(self, didReceiveProxyLogging: .logWarn, message: " \(String(describing: ChartLoadingError.contentProcessDidTerminate.errorDescription))")
+    }
+}
+
+extension ChartIQView: ChartLoadingTrackingDelegate {
+    func chartDidFinishLoading(elapsedTimes: [ChartLoadingElapsedTime]) {
+        loadingDelegate?.chartIQView(self, didFinishLoadingWithElapsedTimes: elapsedTimes)
+    }
+    
+    func chartDidFailLoadingWithError(_ error: Error, elapsedTimes: [ChartLoadingElapsedTime], for url: String) {
+        loadingDelegate?.chartIQView(self, didFailLoadingWithError: error, elapsedTimes: elapsedTimes, for: url)
+    }
 }
